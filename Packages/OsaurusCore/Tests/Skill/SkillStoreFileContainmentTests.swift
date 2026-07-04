@@ -158,6 +158,60 @@ struct SkillStoreFileContainmentTests {
         }
     }
 
+    @Test func loadAllIncludesConfiguredExternalSkillRoot() async throws {
+        try await StoragePathsTestLock.shared.run {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+                "osaurus-external-skill-roots-\(UUID().uuidString)"
+            )
+            let previousRoot = OsaurusPaths.overrideRoot
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            OsaurusPaths.overrideRoot = root
+            defer {
+                OsaurusPaths.overrideRoot = previousRoot
+                try? FileManager.default.removeItem(at: root)
+            }
+
+            let externalRoot = root.appendingPathComponent("external-skills", isDirectory: true)
+            let skillDir = externalRoot.appendingPathComponent("external-helper", isDirectory: true)
+            try FileManager.default.createDirectory(at: skillDir, withIntermediateDirectories: true)
+            try """
+                ---
+                name: external-helper
+                description: Help from another skill tree.
+                ---
+
+                # External Helper
+
+                Use this external skill.
+                """.write(to: skillDir.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
+
+            let savedRoot = try SkillStore.addExternalSkillRoot(path: externalRoot.path)
+            let duplicateRoot = try SkillStore.addExternalSkillRoot(path: externalRoot.path)
+            #expect(duplicateRoot.id == savedRoot.id)
+            #expect(SkillStore.externalSkillRoots() == [savedRoot])
+
+            let loaded = await SkillStore.loadAll()
+            let skill = try #require(loaded.first { $0.name == "External Helper" })
+            #expect(skill.isExternal)
+            #expect(skill.sourceRootId == savedRoot.id)
+            #expect(skill.sourceDirectoryPath == skillDir.resolvingSymlinksInPath().standardizedFileURL.path)
+            #expect(SkillStore.skillDirectory(for: skill).path == skill.sourceDirectoryPath)
+            let loadedById = await SkillStore.load(id: skill.id)
+            #expect(loadedById?.id == skill.id)
+
+            let reloaded = await SkillStore.loadAll()
+            #expect(reloaded.first { $0.name == "External Helper" }?.id == skill.id)
+
+            await #expect(throws: SkillStoreFileError.self) {
+                try await SkillStore.addReference(to: skill, name: "notes.md", content: Data("blocked".utf8))
+            }
+
+            try SkillStore.removeExternalSkillRoot(id: savedRoot.id)
+            #expect(SkillStore.externalSkillRoots().isEmpty)
+            #expect(await SkillStore.load(id: skill.id) == nil)
+        }
+    }
+
     private static func withTempSkill<T: Sendable>(
         _ body: @Sendable (URL, Skill) async throws -> T
     ) async throws -> T {

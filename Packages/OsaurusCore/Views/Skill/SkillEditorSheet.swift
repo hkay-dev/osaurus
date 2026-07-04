@@ -47,9 +47,19 @@ struct SkillEditorSheet: View {
         return nil
     }
 
-    private var isBuiltIn: Bool {
-        if case .edit(let skill) = mode { return skill.isBuiltIn }
+    private var isReadOnly: Bool {
+        if case .edit(let skill) = mode {
+            return skill.isBuiltIn || skill.isFromPlugin || skill.isExternal
+        }
         return false
+    }
+
+    private var readOnlyReason: String {
+        guard case .edit(let skill) = mode else { return "" }
+        if skill.isBuiltIn { return L("Built-in skills are read-only") }
+        if skill.isFromPlugin { return L("Plugin skills are read-only") }
+        if skill.isExternal { return L("External skills are read-only") }
+        return ""
     }
 
     private var canSave: Bool {
@@ -150,13 +160,13 @@ struct SkillEditorSheet: View {
             .frame(width: 40, height: 40)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(isEditing ? (isBuiltIn ? L("View Skill") : L("Edit Skill")) : (L("Create Skill")))
+                Text(isEditing ? (isReadOnly ? L("View Skill") : L("Edit Skill")) : (L("Create Skill")))
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundColor(themeManager.currentTheme.primaryText)
 
                 Text(
                     isEditing
-                        ? (isBuiltIn ? L("Preview built-in skill instructions") : L("Modify your skill's instructions"))
+                        ? (isReadOnly ? L("Preview skill instructions") : L("Modify your skill's instructions"))
                         : L("Define specialized guidance for the AI")
                 )
                 .font(.system(size: 12))
@@ -214,7 +224,7 @@ struct SkillEditorSheet: View {
                                 text: $name,
                                 icon: nil
                             )
-                            .disabled(isBuiltIn)
+                            .disabled(isReadOnly)
                         }
 
                         // Description
@@ -228,7 +238,7 @@ struct SkillEditorSheet: View {
                                 text: $description,
                                 icon: nil
                             )
-                            .disabled(isBuiltIn)
+                            .disabled(isReadOnly)
                         }
                     }
                 }
@@ -248,7 +258,7 @@ struct SkillEditorSheet: View {
                                     text: $category,
                                     icon: nil
                                 )
-                                .disabled(isBuiltIn)
+                                .disabled(isReadOnly)
                             }
 
                             // Version
@@ -262,7 +272,7 @@ struct SkillEditorSheet: View {
                                     text: $version,
                                     icon: nil
                                 )
-                                .disabled(isBuiltIn)
+                                .disabled(isReadOnly)
                             }
                             .frame(width: 80)
                         }
@@ -278,7 +288,7 @@ struct SkillEditorSheet: View {
                                 text: $author,
                                 icon: nil
                             )
-                            .disabled(isBuiltIn)
+                            .disabled(isReadOnly)
                         }
                     }
                 }
@@ -311,6 +321,7 @@ struct SkillEditorSheet: View {
                             .toggleStyle(.switch)
                             .controlSize(.small)
                             .labelsHidden()
+                            .disabled(isReadOnly)
                     }
                     .padding(12)
                     .background(
@@ -360,7 +371,7 @@ struct SkillEditorSheet: View {
 
             // Editor area
             ZStack(alignment: .topLeading) {
-                if instructions.isEmpty && !isBuiltIn {
+                if instructions.isEmpty && !isReadOnly {
                     Text(
                         "Write guidance for the AI...\n\nExample:\n## When to use this skill\n- Describe scenarios\n\n## Guidelines\n- Add specific guidance",
                         bundle: .module
@@ -372,8 +383,8 @@ struct SkillEditorSheet: View {
                     .allowsHitTesting(false)
                 }
 
-                if isBuiltIn {
-                    // Read-only view for built-in skills
+                if isReadOnly {
+                    // Read-only view for externally managed skills
                     ScrollView {
                         Text(instructions)
                             .font(.system(size: 13, design: .monospaced))
@@ -409,7 +420,7 @@ struct SkillEditorSheet: View {
     private var footerView: some View {
         HStack(spacing: 12) {
             // Keyboard hint
-            if !isBuiltIn {
+            if !isReadOnly {
                 HStack(spacing: 4) {
                     Text("⌘")
                         .font(.system(size: 10, weight: .medium, design: .rounded))
@@ -425,11 +436,11 @@ struct SkillEditorSheet: View {
                 .foregroundColor(themeManager.currentTheme.tertiaryText)
             }
 
-            if isBuiltIn {
+            if isReadOnly {
                 HStack(spacing: 6) {
                     Image(systemName: "lock.fill")
                         .font(.system(size: 11))
-                    Text("Built-in skills are read-only", bundle: .module)
+                    Text(readOnlyReason)
                         .font(.system(size: 12))
                 }
                 .foregroundColor(themeManager.currentTheme.tertiaryText)
@@ -437,10 +448,10 @@ struct SkillEditorSheet: View {
 
             Spacer()
 
-            Button(isBuiltIn ? L("Close") : L("Cancel"), action: onCancel)
+            Button(isReadOnly ? L("Close") : L("Cancel"), action: onCancel)
                 .buttonStyle(SkillSecondaryButtonStyle())
 
-            if !isBuiltIn {
+            if !isReadOnly {
                 Button(isEditing ? L("Save Changes") : L("Create Skill")) {
                     saveSkill()
                 }

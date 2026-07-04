@@ -138,7 +138,7 @@ public final class SkillManager {
     }
 
     public func update(_ skill: Skill) async {
-        guard !skill.isBuiltIn && !skill.isFromPlugin else { return }
+        guard !skill.isBuiltIn && !skill.isFromPlugin && !skill.isExternal else { return }
         var updated = skill
         updated.updatedAt = Date()
         if updated.directoryName == nil {
@@ -152,8 +152,8 @@ public final class SkillManager {
 
     @discardableResult
     public func delete(id: UUID) async -> Bool {
-        // Prevent deleting plugin-provided skills
-        if let skill = skill(for: id), skill.isFromPlugin { return false }
+        // Prevent deleting externally managed skills
+        if let skill = skill(for: id), skill.isFromPlugin || skill.isExternal { return false }
         let result = await SkillStore.delete(id: id)
         if result {
             await refresh()
@@ -201,6 +201,7 @@ public final class SkillManager {
 
     public func setEnabled(_ enabled: Bool, for id: UUID) async {
         guard var skill = skill(for: id) else { return }
+        guard !skill.isExternal else { return }
         skill.enabled = enabled
         skill.updatedAt = Date()
 

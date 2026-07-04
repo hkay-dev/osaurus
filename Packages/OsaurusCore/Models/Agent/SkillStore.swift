@@ -6,6 +6,7 @@
 //  Directory structure: skills/{skill-name}/SKILL.md with optional references/ and assets/
 //
 
+import CryptoKit
 import Foundation
 
 /// Errors from skill file path validation before a caller-controlled path can
@@ -13,13 +14,51 @@ import Foundation
 public enum SkillStoreFileError: Error, LocalizedError, Sendable, Equatable {
     case invalidRelativePath
     case pathEscapesDirectory
+    case cannotModifyExternalSkill
 
     public var errorDescription: String? {
         switch self {
         case .invalidRelativePath: return "Skill file path must be a non-empty relative path"
         case .pathEscapesDirectory: return "Skill file path escapes its containing directory"
+        case .cannotModifyExternalSkill: return "External skills are read-only"
         }
     }
+}
+
+public struct ExternalSkillRoot: Codable, Sendable, Equatable {
+    public var id: String
+    public var path: String
+    public var enabled: Bool
+
+    public init(id: String, path: String, enabled: Bool = true) {
+        self.id = id
+        self.path = path
+        self.enabled = enabled
+    }
+}
+
+extension ExternalSkillRoot {
+    var url: URL {
+        URL(fileURLWithPath: Self.expandedPath(path), isDirectory: true)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+    }
+
+    private static func expandedPath(_ path: String) -> String {
+        if path == "~" {
+            return FileManager.default.homeDirectoryForCurrentUser.path
+        }
+        if path.hasPrefix("~/") {
+            return FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(String(path.dropFirst(2)))
+                .path
+        }
+        return path
+    }
+}
+
+private struct ExternalSkillRootsConfig: Codable {
+    var roots: [ExternalSkillRoot]
 }
 
 public enum SkillStore {
@@ -34,22 +73,10 @@ public enum SkillStore {
 
         var savedSkills: [UUID: Skill] = [:]
 
-        // Load custom skills (non-hidden directories)
-        if let contents = try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) {
-            for item in contents {
-                var isDirectory: ObjCBool = false
-                guard FileManager.default.fileExists(atPath: item.path, isDirectory: &isDirectory),
-                    isDirectory.boolValue,
-                    let skill = loadFromDirectory(item)
-                else {
-                    continue
-                }
-                savedSkills[skill.id] = skill
-            }
+        savedSkills.merge(loadSkills(from: directory), uniquingKeysWith: { first, _ in first })
+
+        for root in externalSkillRoots() where root.enabled {
+            savedSkills.merge(loadSkills(from: root.url, sourceRoot: root), uniquingKeysWith: { first, _ in first })
         }
 
         // Load built-in skill states (hidden directories starting with .)
@@ -113,29 +140,7 @@ public enum SkillStore {
             return builtIn
         }
 
-        let directory = skillsDirectory()
-        guard
-            let contents = try? FileManager.default.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            )
-        else {
-            return nil
-        }
-
-        for item in contents {
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: item.path, isDirectory: &isDirectory),
-                isDirectory.boolValue,
-                let skill = loadFromDirectory(item),
-                skill.id == id
-            else {
-                continue
-            }
-            return skill
-        }
-        return nil
+        return await loadAll().first { $0.id == id }
     }
 
     /// Save a skill to disk
@@ -144,6 +149,7 @@ public enum SkillStore {
             saveBuiltInState(skill)
             return
         }
+        guard !skill.isExternal else { return }
 
         let slug = skill.xplaceholder_agentSkillsNamex
         var skillDir = skillsDirectory().appendingPathComponent(slug)
@@ -229,6 +235,9 @@ public enum SkillStore {
 
     /// Get the directory URL for a skill
     public static func skillDirectory(for skill: Skill) -> URL {
+        if let url = skill.sourceDirectoryURL {
+            return url
+        }
         var dirName = skill.directoryName ?? skill.xplaceholder_agentSkillsNamex
         if dirName.isEmpty {
             dirName = "skill-\(skill.id.uuidString.prefix(8).lowercased())"
@@ -240,18 +249,21 @@ public enum SkillStore {
 
     /// Add a reference file to a skill
     public static func addReference(to skill: Skill, name: String, content: Data) async throws {
+        guard !skill.isExternal else { throw SkillStoreFileError.cannotModifyExternalSkill }
         let refsDir = skillDirectory(for: skill).appendingPathComponent("references")
         try writeSkillFile(content, named: name, in: refsDir)
     }
 
     /// Add an asset file to a skill
     public static func addAsset(to skill: Skill, name: String, content: Data) async throws {
+        guard !skill.isExternal else { throw SkillStoreFileError.cannotModifyExternalSkill }
         let assetsDir = skillDirectory(for: skill).appendingPathComponent("assets")
         try writeSkillFile(content, named: name, in: assetsDir)
     }
 
     /// Remove a file from a skill
     public static func removeFile(from skill: Skill, relativePath: String) async throws {
+        guard !skill.isExternal else { throw SkillStoreFileError.cannotModifyExternalSkill }
         let skillDir = skillDirectory(for: skill)
         let fileURL = try containedFileURL(for: relativePath, in: skillDir)
         try ensureResolvedContainment(of: fileURL, in: skillDir)
@@ -270,6 +282,76 @@ public enum SkillStore {
 
     private static func skillsDirectory() -> URL {
         OsaurusPaths.skills()
+    }
+
+    public static func externalSkillRoots() -> [ExternalSkillRoot] {
+        guard let data = try? Data(contentsOf: externalSkillRootsConfigURL()),
+            let config = try? JSONDecoder().decode(ExternalSkillRootsConfig.self, from: data)
+        else {
+            return []
+        }
+
+        return normalizedExternalSkillRoots(config.roots)
+    }
+
+    @discardableResult
+    public static func addExternalSkillRoot(path: String) throws -> ExternalSkillRoot {
+        let newRoot = ExternalSkillRoot(id: externalSkillRootId(for: path), path: path)
+        var roots = externalSkillRoots()
+        if let existing = roots.first(where: { $0.url.path == newRoot.url.path }) {
+            return existing
+        }
+        roots.append(newRoot)
+        try saveExternalSkillRoots(roots)
+        return newRoot
+    }
+
+    public static func removeExternalSkillRoot(id: String) throws {
+        try saveExternalSkillRoots(externalSkillRoots().filter { $0.id != id })
+    }
+
+    public static func saveExternalSkillRoots(_ roots: [ExternalSkillRoot]) throws {
+        let url = externalSkillRootsConfigURL()
+        OsaurusPaths.ensureExistsSilent(url.deletingLastPathComponent())
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(ExternalSkillRootsConfig(roots: normalizedExternalSkillRoots(roots)))
+            .write(to: url, options: .atomic)
+    }
+
+    private static func normalizedExternalSkillRoots(_ roots: [ExternalSkillRoot]) -> [ExternalSkillRoot] {
+        var seen = Set<String>()
+        var seenPaths = Set<String>()
+        return roots.compactMap { root in
+            let id = root.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty, !root.path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                seen.insert(id).inserted,
+                seenPaths.insert(root.url.path).inserted
+            else {
+                return nil
+            }
+            var normalized = root
+            normalized.id = id
+            return normalized
+        }
+    }
+
+    private static func externalSkillRootId(for path: String) -> String {
+        let base =
+            URL(fileURLWithPath: path, isDirectory: true).lastPathComponent
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+            .components(separatedBy: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-")).inverted)
+            .joined()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        let digest = Array(SHA256.hash(data: Data(path.utf8))).prefix(4)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "\((base.isEmpty ? "external-skills" : base))-\(digest)"
+    }
+
+    private static func externalSkillRootsConfigURL() -> URL {
+        OsaurusPaths.config().appendingPathComponent("skill-roots.json")
     }
 
     private static func writeSkillFile(_ content: Data, named name: String, in baseDirectory: URL) throws {
@@ -365,16 +447,52 @@ public enum SkillStore {
         (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) != nil
     }
 
-    private static func loadFromDirectory(_ directoryURL: URL) -> Skill? {
+    private static func loadSkills(from directory: URL, sourceRoot: ExternalSkillRoot? = nil) -> [UUID: Skill] {
+        guard
+            let contents = try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )
+        else {
+            return [:]
+        }
+
+        var loaded: [UUID: Skill] = [:]
+        for item in contents {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: item.path, isDirectory: &isDirectory),
+                isDirectory.boolValue,
+                let skill = loadFromDirectory(item, sourceRoot: sourceRoot)
+            else {
+                continue
+            }
+            loaded[skill.id] = skill
+        }
+        return loaded
+    }
+
+    private static func loadFromDirectory(_ directoryURL: URL, sourceRoot: ExternalSkillRoot? = nil) -> Skill? {
         let skillMdPath = directoryURL.appendingPathComponent("SKILL.md")
         guard FileManager.default.fileExists(atPath: skillMdPath.path) else { return nil }
 
         do {
             let content = try String(contentsOf: skillMdPath, encoding: .utf8)
             let parsed = try Skill.parseAnyFormat(from: content)
+            let resolvedDirectory = directoryURL.resolvingSymlinksInPath().standardizedFileURL
+            let id =
+                explicitSkillId(in: content)
+                ?? sourceRoot.map {
+                    deterministicExternalSkillId(
+                        sourceRootId: $0.id,
+                        directoryName: directoryURL.lastPathComponent,
+                        name: parsed.name
+                    )
+                }
+                ?? parsed.id
 
             return Skill(
-                id: parsed.id,
+                id: id,
                 name: parsed.name,
                 description: parsed.description,
                 version: parsed.version,
@@ -388,12 +506,42 @@ public enum SkillStore {
                 references: loadFilesFromSubdirectory(directoryURL, subdirectory: "references"),
                 assets: loadFilesFromSubdirectory(directoryURL, subdirectory: "assets"),
                 directoryName: directoryURL.lastPathComponent,
-                pluginId: parsed.pluginId
+                pluginId: parsed.pluginId,
+                sourceRootId: sourceRoot?.id,
+                sourceDirectoryPath: sourceRoot == nil ? nil : resolvedDirectory.path
             )
         } catch {
             print("[Osaurus] Failed to load skill from \(directoryURL.lastPathComponent): \(error)")
             return nil
         }
+    }
+
+    private static func explicitSkillId(in content: String) -> UUID? {
+        guard let split = Skill.splitFrontmatter(content) else { return nil }
+        let frontmatter = Skill.parseYamlBlock(split.frontmatterLines)
+        if let idString = frontmatter["id"] as? String, let id = UUID(uuidString: idString) {
+            return id
+        }
+        if let metadata = frontmatter["metadata"] as? [String: Any],
+            let idString = metadata["osaurus-id"] as? String,
+            let id = UUID(uuidString: idString)
+        {
+            return id
+        }
+        return nil
+    }
+
+    private static func deterministicExternalSkillId(sourceRootId: String, directoryName: String, name: String) -> UUID {
+        let seed = "external-skill:\(sourceRootId):\(directoryName):\(name)"
+        let bytes = Array(SHA256.hash(data: Data(seed.utf8)))
+        return UUID(
+            uuid: (
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[8], bytes[9], bytes[10], bytes[11],
+                bytes[12], bytes[13], bytes[14], bytes[15]
+            )
+        )
     }
 
     private static func loadFilesFromSubdirectory(_ skillDir: URL, subdirectory: String) -> [SkillFile] {

@@ -55,6 +55,18 @@ public struct Skill: Codable, Identifiable, Sendable, Equatable {
     public var assets: [SkillFile]
     /// The directory name (Agent Skills format: lowercase-with-hyphens)
     public var directoryName: String?
+    /// External skill root identifier when loaded from a configured read-only root.
+    public var sourceRootId: String?
+    /// Absolute directory path for skills loaded from a configured external root.
+    public var sourceDirectoryPath: String?
+
+    public var isExternal: Bool {
+        sourceRootId != nil
+    }
+
+    public var sourceDirectoryURL: URL? {
+        sourceDirectoryPath.map { URL(fileURLWithPath: $0, isDirectory: true) }
+    }
 
     public init(
         id: UUID = UUID(),
@@ -72,7 +84,9 @@ public struct Skill: Codable, Identifiable, Sendable, Equatable {
         references: [SkillFile] = [],
         assets: [SkillFile] = [],
         directoryName: String? = nil,
-        pluginId: String? = nil
+        pluginId: String? = nil,
+        sourceRootId: String? = nil,
+        sourceDirectoryPath: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -90,6 +104,8 @@ public struct Skill: Codable, Identifiable, Sendable, Equatable {
         self.assets = assets
         self.directoryName = directoryName
         self.pluginId = pluginId
+        self.sourceRootId = sourceRootId
+        self.sourceDirectoryPath = sourceDirectoryPath
     }
 
     /// Total count of associated files

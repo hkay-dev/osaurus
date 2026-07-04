@@ -29,6 +29,7 @@ struct SkillsView: View {
     @State private var pendingOverwriteImportURL: URL?
     @State private var pendingOverwriteSkillName = ""
     @State private var showOverwriteConfirmation = false
+    @State private var externalSkillRoots: [ExternalSkillRoot] = []
 
     /// Base skill set for a tab: All, Installed (user-created + plugin), or
     /// Default (built-in).
@@ -109,6 +110,13 @@ struct SkillsView: View {
                     ScrollView {
                         LazyVStack(spacing: 12) {
                             let shown = filteredSkills
+                            if !externalSkillRoots.isEmpty {
+                                ExternalSkillRootsSection(
+                                    roots: externalSkillRoots,
+                                    onRemove: removeExternalSkillRoot
+                                )
+                            }
+
                             if shown.isEmpty {
                                 emptyState
                             }
@@ -241,6 +249,7 @@ struct SkillsView: View {
         }
         .onAppear {
             Task { @MainActor in
+                loadExternalSkillRoots()
                 await skillManager.refresh()
                 withAnimation(.easeOut(duration: 0.25).delay(0.05)) {
                     hasAppeared = true
@@ -328,6 +337,47 @@ struct SkillsView: View {
     }
 
     @MainActor
+    private func addExternalSkillRoot() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.title = L("Add External Skill Folder")
+        panel.message = L("Choose a folder containing Agent Skills directories")
+
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor in
+                do {
+                    let root = try SkillStore.addExternalSkillRoot(path: url.path)
+                    loadExternalSkillRoots()
+                    await skillManager.refresh()
+                    showToast(L("Added \"\(root.path)\""))
+                } catch {
+                    showToast(L("Could not add skill folder: \(error.localizedDescription)"), isError: true)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func removeExternalSkillRoot(_ root: ExternalSkillRoot) {
+        do {
+            try SkillStore.removeExternalSkillRoot(id: root.id)
+            loadExternalSkillRoots()
+            Task { @MainActor in await skillManager.refresh() }
+            showToast(L("Removed \"\(root.path)\""))
+        } catch {
+            showToast(L("Could not remove skill folder: \(error.localizedDescription)"), isError: true)
+        }
+    }
+
+    @MainActor
+    private func loadExternalSkillRoots() {
+        externalSkillRoots = SkillStore.externalSkillRoots()
+    }
+
+    @MainActor
     private func performSkillImport(from url: URL, overwriteExisting: Bool) async {
         isProcessing = true
         defer { isProcessing = false }
@@ -399,12 +449,18 @@ struct SkillsView: View {
         ) {
             HeaderIconButton("arrow.clockwise", isLoading: skillManager.isRefreshing, help: "Refresh skills") {
                 Task { @MainActor in
+                    loadExternalSkillRoots()
                     await skillManager.refresh()
                 }
             }
 
             HeaderIconButton("square.and.arrow.down", help: "Import skill") {
                 importSkill()
+            }
+            .disabled(isProcessing || skillManager.isRefreshing)
+
+            HeaderSecondaryButton("Add Folder", icon: "folder.badge.plus") {
+                addExternalSkillRoot()
             }
             .disabled(isProcessing || skillManager.isRefreshing)
 
@@ -435,6 +491,67 @@ struct SkillsView: View {
                 toastMessage = nil
             }
         }
+    }
+}
+
+// MARK: - External Skill Roots
+
+private struct ExternalSkillRootsSection: View {
+    @Environment(\.theme) private var theme
+
+    let roots: [ExternalSkillRoot]
+    let onRemove: (ExternalSkillRoot) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("External skill folders", bundle: .module)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(theme.secondaryText)
+
+            VStack(spacing: 0) {
+                ForEach(roots, id: \.id) { root in
+                    HStack(spacing: 10) {
+                        Image(systemName: "folder")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(theme.accentColor)
+
+                        Text(root.path)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(theme.primaryText)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+
+                        Spacer()
+
+                        Button {
+                            onRemove(root)
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(theme.tertiaryText)
+                                .frame(width: 24, height: 24)
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                        .help(Text("Remove external skill folder", bundle: .module))
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+
+                    if root.id != roots.last?.id {
+                        Divider().background(theme.inputBorder)
+                    }
+                }
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(theme.secondaryBackground)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(theme.inputBorder, lineWidth: 1)
+                    )
+            )
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -511,6 +628,20 @@ private struct SkillRow: View {
                                         Image(systemName: "puzzlepiece.extension")
                                             .font(.system(size: 8))
                                         Text(pluginDisplayName)
+                                            .font(.system(size: 9, weight: .medium))
+                                    }
+                                    .foregroundColor(theme.accentColor)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(
+                                        Capsule()
+                                            .fill(theme.accentColor.opacity(0.1))
+                                    )
+                                } else if skill.isExternal {
+                                    HStack(spacing: 3) {
+                                        Image(systemName: "folder.badge.gearshape")
+                                            .font(.system(size: 8))
+                                        Text("External", bundle: .module)
                                             .font(.system(size: 9, weight: .medium))
                                     }
                                     .foregroundColor(theme.accentColor)
@@ -639,7 +770,7 @@ private struct SkillRow: View {
 
                     // Action buttons
                     HStack(spacing: 8) {
-                        if !skill.isFromPlugin {
+                        if !skill.isFromPlugin && !skill.isExternal {
                             Button(action: onEdit) {
                                 HStack(spacing: 4) {
                                     Image(systemName: skill.isBuiltIn ? "eye" : "pencil")
@@ -657,7 +788,7 @@ private struct SkillRow: View {
                             }
                             .buttonStyle(PlainButtonStyle())
                         } else {
-                            // View-only button for plugin skills
+                            // View-only button for externally managed skills
                             Button(action: onEdit) {
                                 HStack(spacing: 4) {
                                     Image(systemName: "eye")
@@ -676,7 +807,7 @@ private struct SkillRow: View {
                             .buttonStyle(PlainButtonStyle())
                         }
 
-                        if !skill.isFromPlugin {
+                        if !skill.isFromPlugin && !skill.isExternal {
                             Button(action: onExport) {
                                 HStack(spacing: 4) {
                                     Image(systemName: "square.and.arrow.up")
@@ -697,18 +828,21 @@ private struct SkillRow: View {
 
                         Spacer()
 
-                        if skill.isFromPlugin {
-                            // Info badge for plugin skills
+                        if skill.isFromPlugin || skill.isExternal {
+                            // Info badge for externally managed skills
                             HStack(spacing: 4) {
                                 Image(systemName: "info.circle")
                                     .font(.system(size: 10))
-                                Text("Managed by plugin", bundle: .module)
+                                Text(
+                                    LocalizedStringKey(skill.isExternal ? "Managed externally" : "Managed by plugin"),
+                                    bundle: .module
+                                )
                                     .font(.system(size: 10, weight: .medium))
                             }
                             .foregroundColor(theme.tertiaryText)
                         }
 
-                        if !skill.isBuiltIn && !skill.isFromPlugin {
+                        if !skill.isBuiltIn && !skill.isFromPlugin && !skill.isExternal {
                             Button(action: { showDeleteConfirm = true }) {
                                 HStack(spacing: 4) {
                                     Image(systemName: "trash")
